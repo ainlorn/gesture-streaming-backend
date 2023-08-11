@@ -16,7 +16,7 @@ from einops import rearrange
 import json
 
 FONTFACE = cv2.FONT_HERSHEY_COMPLEX
-FONTSCALE = 1.3
+FONTSCALE = 0.8
 FONTCOLOR = (255, 255, 255)  # BGR, white
 MSGCOLOR = (128, 128, 128)  # BGR, gray
 THICKNESS = 1
@@ -167,7 +167,8 @@ def inference(model):
 
         results = model.predict(cur_windows)
         if not results:
-            result_queue.append({'labels': {0: 'no'}, 'confidence': {0: 0.0}})
+            #result_queue.append({'labels': {0: 'no'}, 'confidence': {0: 0.0}})
+            pass
         else:
             result_queue.append(results)
 
