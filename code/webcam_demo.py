@@ -6,7 +6,9 @@ from operator import itemgetter
 from threading import Thread
 import os
 from sys import platform
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
+import websockets.sync.server
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
 import cv2
 import numpy as np
@@ -26,6 +28,64 @@ EXCLUED_STEPS = [
     'OpenCVInit', 'OpenCVDecode', 'DecordInit', 'DecordDecode', 'PyAVInit',
     'PyAVDecode', 'RawFrameDecode', 'FrameSelector'
 ]
+
+latest_result = None
+
+class ThreadedCapture(object):
+    def __init__(self, source):
+        self.width = 0
+        self.height = 0
+        self.dropped_frames = 0
+        self.source = source
+        self.capture = None
+        self.active = False
+
+        self.reset_stream()
+
+        self.thread = Thread(target=self.update, args=())
+        self.thread.daemon = True
+        self.thread.start()
+
+        self.status = False
+        self.frame = None
+
+    def open(self):
+        self.capture = cv2.VideoCapture(self.source)
+        self.width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    def reset_stream(self):
+        while not self.capture or not self.capture.isOpened():
+            self.active = False
+            if self.capture:
+                self.capture.release()
+            print("Waiting for stream...")
+            time.sleep(0.5)
+            self.open()
+        self.active = True
+
+    def update(self):
+        while True:
+            if self.capture.isOpened():
+                (self.status, self.frame) = self.capture.read()
+                if self.frame is None:
+                    self.dropped_frames += 1
+                else:
+                    self.dropped_frames = 0
+                if self.dropped_frames > 50:
+                    print("Dropped frames detected. Resetting stream...")
+                    self.dropped_frames = 0
+                    self.capture.release()
+                    self.reset_stream()
+            else:
+                time.sleep(0.5)
+                self.open()
+
+    def grab_frame(self):
+        if self.status:
+            return self.frame
+        return None
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MMAction2 webcam demo')
@@ -55,6 +115,7 @@ def parse_args():
         help='Use OpenVINO backend for inference. Available only on Linux')
     args = parser.parse_args()
     return args
+
 
 def init_model(config_path):
     """
@@ -90,7 +151,9 @@ def init_model(config_path):
     except ValueError as e:
         raise ValueError(f"Error creating Predictor configuration: {e}")
 
+
 def show_results(cam_disp):
+    global latest_result
     args = parse_args()
     print('Press "Esc", "q" or "Q" to exit')
     text_info = {}
@@ -99,9 +162,11 @@ def show_results(cam_disp):
     preds_queue = deque(maxlen=5)
     while True:
         msg = 'Waiting for action ...'
-        _, frame = camera.read()
+        frame = camera.grab_frame()
+        if frame is None:
+            continue
 
-        #last dim is BGR2RGB
+        # last dim is BGR2RGB
         frame_queue.append(np.array(cv2.resize(frame, (224, 224))[:, :, ::-1]))
         location_fps = (0, 40)
         if len(result_queue) != 0:
@@ -113,8 +178,10 @@ def show_results(cam_disp):
 
             if len(preds_queue) == 0:
                 preds_queue.append(label)
+                latest_result = label
             elif preds_queue[-1] != label and len(preds_queue) != 0:
                 preds_queue.append(label)
+                latest_result = label
             location_label = (0, 110)
             text_label = label + ': ' + str(round(confidence, 2))
             text_info[location_label] = text_label
@@ -124,22 +191,22 @@ def show_results(cam_disp):
         elif len(text_info) != 0:
             for location, text in text_info.items():
                 cv2.putText(frame, text, location, FONTFACE, FONTSCALE,
-                        FONTCOLOR, THICKNESS, LINETYPE)
+                            FONTCOLOR, THICKNESS, LINETYPE)
 
         text_fps = f"FPS: {model_fps:.2f}"
         text_info[location_fps] = text_fps
         cv2.putText(frame, text_info[location_fps], location_fps, FONTFACE, FONTSCALE,
-                            FONTCOLOR, THICKNESS, LINETYPE)
+                    FONTCOLOR, THICKNESS, LINETYPE)
 
         deque_location = (1, 450)
         deque_info[deque_location] = " ".join(list(preds_queue))
 
         for location, text in deque_info.items():
-                cv2.rectangle(frame, (0,  frame_height), (int(frame_width), int(frame_height)), (255, 255, 255), -1)
-                cv2.putText(frame, text, deque_location, FONTFACE, FONTSCALE,
-                            FONTCOLOR, THICKNESS, LINETYPE)
+            cv2.rectangle(frame, (0, frame_height), (int(frame_width), int(frame_height)), (255, 255, 255), -1)
+            cv2.putText(frame, text, deque_location, FONTFACE, FONTSCALE,
+                        FONTCOLOR, THICKNESS, LINETYPE)
 
-        #add frame to dict()
+        # add frame to dict()
         cam_disp['cam'] = frame
 
         if args.drawing_fps > 0:
@@ -167,7 +234,7 @@ def inference(model):
 
         results = model.predict(cur_windows)
         if not results:
-            #result_queue.append({'labels': {0: 'no'}, 'confidence': {0: 0.0}})
+            # result_queue.append({'labels': {0: 'no'}, 'confidence': {0: 0.0}})
             pass
         else:
             result_queue.append(results)
@@ -183,20 +250,39 @@ def on_resize(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONUP:
         cv2.resizeWindow('cam', 640, 480)
 
+
+def ws_thread(conn):
+    global latest_result
+    prev = latest_result
+    while True:
+        if prev != latest_result and latest_result != 'нет жеста':
+            prev = latest_result
+            conn.send(latest_result)
+        time.sleep(0.1)
+
+def ws_start():
+    with websockets.sync.server.serve(ws_thread, host='0.0.0.0', port=9000) as server:
+        server.serve_forever()
+
+
 def main():
     global frame_queue, camera, threshold, \
         data, \
         result_queue, drawing_fps, inference_fps, cam_disp, model_fps
     args = parse_args()
+    ws = Thread(target=ws_start, daemon=True)
+    ws.start()
+
     model_fps = 0
     model = init_model(args.config_path)
-    camera = cv2.VideoCapture(args.camera_id)
+    camera = ThreadedCapture('rtsp://localhost:8554/mystream')
     global frame_width, frame_height
-    frame_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_width = camera.width
+    frame_height = camera.height
     data = dict(img_shape=None, modality='RGB', label=-1)
 
-    #use dict() to append frames
+
+    # use dict() to append frames
     cam_disp = {}
     cam_disp['cam'] = None
     cv2.namedWindow('cam', cv2.WINDOW_NORMAL)
@@ -208,7 +294,7 @@ def main():
         pr = Thread(target=inference, args=(model,), daemon=True)
         pw.start()
         pr.start()
-        #cv2.imshow works in the main thread
+        # cv2.imshow works in the main thread
         while True:
             if cam_disp['cam'] is not None:
                 cv2.imshow('cam', cam_disp['cam'])
@@ -218,5 +304,7 @@ def main():
 
     except KeyboardInterrupt:
         pass
+
+
 if __name__ == '__main__':
     main()
